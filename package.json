@@ -1,0 +1,18 @@
+{
+  "name": "rag-chatbot",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.55",
+    "@langchain/langgraph": "^0.2.72",
+    "@langchain/openai": "^0.5.10",
+    "fs": "^0.0.1-security",
+    "uuid": "^11.1.0"
+  }
+}
