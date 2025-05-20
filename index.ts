@@ -1,101 +1,93 @@
-import { ChatOpenAI } from "@langchain/openai";
-import {
-  START,
-  END,
-  MessagesAnnotation,
-  StateGraph,
-  MemorySaver,
-} from "@langchain/langgraph";
-import { v4 as uuidv4 } from "uuid";
+import { ChatOpenAI, OpenAIEmbeddings } from "@langchain/openai";
+import "cheerio";
+import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+import { Document } from "@langchain/core/documents";
 import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { pull } from "langchain/hub";
+import { Annotation, StateGraph } from "@langchain/langgraph";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
+import { PineconeStore } from "@langchain/pinecone";
+import { Pinecone as PineconeClient } from "@pinecone-database/pinecone";
 
-// Create a unique thread ID
-const config = { configurable: { thread_id: uuidv4() } };
-const config2 = { configurable: { thread_id: uuidv4() } };
-
-// Initialize the LLM
 const llm = new ChatOpenAI({
   model: "gpt-4o-mini",
   temperature: 0,
 });
 
-// Create a prompt template
-const promptTemplate = ChatPromptTemplate.fromMessages([
-  [
-    "system",
-    "You talk like a pirate. Answer all questions to the best of your ability.",
-  ],
-  ["placeholder", "{messages}"],
-]);
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-large",
+});
 
-// Define the function that calls the model
-const callModel = async (state: typeof MessagesAnnotation.State) => {
-  const response = await llm.invoke(state.messages);
-  return { messages: response };
+// Load documents
+const pTagSelector = "p";
+const cheerioLoader = new CheerioWebBaseLoader(
+  "https://lilianweng.github.io/posts/2023-06-23-agent/",
+  {
+    selector: pTagSelector,
+  }
+);
+
+const docs = await cheerioLoader.load();
+
+// Split documents into chunks
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 1000,
+  chunkOverlap: 200,
+});
+const allSplits = await splitter.splitDocuments(docs);
+
+// Vector store setup
+const pinecone = new PineconeClient({
+  apiKey: process.env.PINECONE_API_KEY!,
+});
+const pineconeIndex = "documents";
+const vectorStore = new PineconeStore(embeddings, {
+  pineconeIndex: pinecone.Index(pineconeIndex),
+  maxConcurrency: 5,
+});
+
+await vectorStore.addDocuments(allSplits);
+
+// Define prompt for question-answering
+const promptTemplate = await pull<ChatPromptTemplate>("rlm/rag-prompt");
+
+// Define state for application
+const InputStateAnnotation = Annotation.Root({
+  question: Annotation<string>,
+});
+
+const StateAnnotation = Annotation.Root({
+  question: Annotation<string>,
+  context: Annotation<Document[]>,
+  answer: Annotation<string>,
+});
+
+// Define application steps
+const retrieve = async (state: typeof InputStateAnnotation.State) => {
+  const retrievedDocs = await vectorStore.similaritySearch(state.question);
+  return { context: retrievedDocs };
 };
 
-const callModel2 = async (state: typeof MessagesAnnotation.State) => {
-  const prompt = await promptTemplate.invoke(state);
-  const response = await llm.invoke(prompt);
-  return { messages: response };
+const generate = async (state: typeof StateAnnotation.State) => {
+  const docsContent = state.context.map((doc) => doc.pageContent).join("\n");
+  const messages = await promptTemplate.invoke({
+    question: state.question,
+    context: docsContent,
+  });
+  const response = await llm.invoke(messages);
+  return { answer: response.content };
 };
 
+// Compile application and test
+const graph = new StateGraph(StateAnnotation)
+  .addNode("retrieve", retrieve)
+  .addNode("generate", generate)
+  .addEdge("__start__", "retrieve")
+  .addEdge("retrieve", "generate")
+  .addEdge("generate", "__end__")
+  .compile();
 
+let inputs = { question: "What is Task Decomposition?" };
 
-// Define a new graph
-const workflow = new StateGraph(MessagesAnnotation)
-  // Define the node and edge
-  .addNode("model", callModel)
-  .addEdge(START, "model")
-  .addEdge("model", END);
-
-const workflow2 = new StateGraph(MessagesAnnotation)
-  // Define the node and edge
-  .addNode("model", callModel2)
-  .addEdge(START, "model")
-  .addEdge("model", END);
-
-// Add memory
-const memory = new MemorySaver();
-const app = workflow.compile({ checkpointer: memory });
-const app2 = workflow2.compile({ checkpointer: memory });
-
-// Run the graph
-const input = [
-  {
-    role: "user",
-    content: "Hi! I'm Satya.",
-  },
-];
-
-const input2 = [
-  {
-    role: "user",
-    content: "What's my name?",
-  },
-];
-
-const input3 = [
-  {
-    role: "user",
-    content: "Hi! I'm Som.",
-  },
-];
-
-const input4 = [
-  {
-    role: "user",
-    content: "What's my name?",
-  },
-];
-
-const output = await app.invoke({ messages: input }, config);
-const output2 = await app.invoke({ messages: input2 }, config);
-const output3 = await app2.invoke({ messages: input3 }, config2);
-const output4 = await app2.invoke({ messages: input4 }, config2);
-// The output contains all messages in the state.
-// This will log the last message in the conversation.
-console.log(output.messages[output.messages.length - 1]?.content);
-console.log(output2.messages[output2.messages.length - 1]?.content);
-console.log(output3.messages[output3.messages.length - 1]?.content);
-console.log(output4.messages[output4.messages.length - 1]?.content);
+const result = await graph.invoke(inputs);
+console.log(result.answer);
